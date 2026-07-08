@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<title>Thriftily</title>
+<link rel="manifest" href="data:application/json,{%22name%22:%22Thriftily%22,%22short_name%22:%22Thriftily%22,%22display%22:%22standalone%22,%22background_color%22:%22%23111%22,%22theme_color%22:%22%23111%22,%22icons%22:[]}">
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  video { width: 100%; flex: 1; object-fit: cover; background: #000; min-height: 0; }
+  #bar { display: flex; gap: 8px; padding: 10px; align-items: center; }
+  button { flex: 1; padding: 14px; font-size: 16px; border: 0; border-radius: 10px;
+    background: #2d6cdf; color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; }
+  button.sec { flex: 0 0 auto; background: #333; }
+  #result { padding: 14px; max-height: 45vh; overflow: auto; }
+  .card { border-radius: 12px; padding: 14px; margin-bottom: 10px; }
+  .FLIP  { background: #10361a; border: 1px solid #2ecc71; }
+  .MAYBE { background: #3a3410; border: 1px solid #f1c40f; }
+  .SKIP  { background: #3a1414; border: 1px solid #e74c3c; }
+  .verdict { font-size: 22px; font-weight: 800; }
+  .item { font-size: 18px; margin: 4px 0; }
+  .muted { color: #aaa; font-size: 14px; }
+  #setup { padding: 16px; }
+  input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #444;
+    background: #1c1c1c; color: #eee; font-size: 16px; }
+  label { display: block; margin: 12px 0 4px; font-size: 14px; color: #bbb; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row input[type=checkbox] { width: auto; }
+</style>
+</head>
+<body>
+
+<div id="setup" hidden>
+  <h2>Thriftily setup</h2>
+  <label>Anthropic API key (stored only on this phone)</label>
+  <input id="key" type="password" placeholder="sk-ant-...">
+  <p class="muted">Get one at console.anthropic.com. Uses <b>claude-haiku-4-5</b> vision
+    (~$0.001–0.003 per scan). The key stays in this browser's localStorage and is sent
+    only to api.anthropic.com.</p>
+  <button onclick="saveKey()">Save &amp; start</button>
+</div>
+
+<video id="cam" playsinline autoplay muted hidden></video>
+
+<div id="bar" hidden>
+  <button id="scan" onclick="scan()">Scan item</button>
+  <button class="sec" onclick="toggleAuto()" id="autoBtn">Auto: off</button>
+  <button class="sec" onclick="showSetup()">🔑</button>
+</div>
+
+<div id="result"></div>
+
+<canvas id="cv" hidden></canvas>
+
+<script>
+const $ = s => document.querySelector(s);
+const MODEL = "claude-haiku-4-5";           // ponytail: cheap vision tier; swap to a bigger model if accuracy matters
+let stream, autoTimer = null;
+
+// --- verdict parsing (the money path: FLIP vs SKIP) -------------------------
+function parseVerdict(text) {
+  // Claude is asked for a JSON object; be defensive about stray prose/fences.
+  const m = text.match(/\{[\s\S]*\}/);
+  let o = {};
+  if (m) { try { o = JSON.parse(m[0]); } catch (e) {} }
+  const v = String(o.verdict || "").toUpperCase();
+  return {
+    verdict: ["FLIP","MAYBE","SKIP"].includes(v) ? v : "MAYBE",
+    item: o.item || "Unknown item",
+    est: o.est_resale_usd || "?",
+    reason: o.reason || text.slice(0, 200)
+  };
+}
+// self-check (runs once; fails loudly in console if the parser breaks)
+(function(){
+  const a = parseVerdict('noise {"verdict":"flip","item":"Pyrex bowl","est_resale_usd":"$40","reason":"vintage"} tail');
+  console.assert(a.verdict === "FLIP" && a.item === "Pyrex bowl" && a.est === "$40", "parseVerdict json", a);
+  const b = parseVerdict("model babbled with no json");
+  console.assert(b.verdict === "MAYBE" && b.reason.length > 0, "parseVerdict fallback", b);
+})();
+// ---------------------------------------------------------------------------
+
+function getKey(){ return localStorage.getItem("anthropic_key") || ""; }
+function saveKey(){
+  const k = $("#key").value.trim();
+  if (!k) return;
+  localStorage.setItem("anthropic_key", k);
+  $("#setup").hidden = true;
+  start();
+}
+function showSetup(){ $("#key").value = getKey(); $("#setup").hidden = false; }
+
+async function start(){
+  $("#cam").hidden = false; $("#bar").hidden = false;
+  if (stream) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } }, audio: false });
+    $("#cam").srcObject = stream;
+  } catch (e) {
+    $("#result").innerHTML = `<div class="card SKIP">Camera failed: ${e.message}.
+      Camera needs HTTPS — serve this file over https:// (any static host) or localhost.</div>`;
+  }
+}
+
+function grabFrame(){
+  const v = $("#cam"), cv = $("#cv");
+  const w = 1024, scale = w / v.videoWidth;       // ponytail: downscale — image tokens cost money
+  cv.width = w; cv.height = Math.round(v.videoHeight * scale);
+  cv.getContext("2d").drawImage(v, 0, 0, cv.width, cv.height);
+  return cv.toDataURL("image/jpeg", 0.7).split(",")[1];
+}
+
+async function scan(){
+  const key = getKey();
+  if (!key) return showSetup();
+  if (!$("#cam").videoWidth) return;
+  $("#scan").disabled = true;
+  const prev = $("#result").innerHTML;
+  $("#result").innerHTML = `<div class="card MAYBE">Scanning…</div>` + prev;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 300,
+        messages: [{ role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: grabFrame() } },
+          { type: "text", text:
+            "You are a reselling expert scanning thrift-store / garage-sale items for flip potential. "
+            + "Look at the image, pick the single most resale-worthy item, and judge whether it's worth "
+            + "grabbing to resell for profit. Reply with ONLY a JSON object: "
+            + '{"item":"short name","verdict":"FLIP|MAYBE|SKIP","est_resale_usd":"$ range","reason":"one sentence"}' }
+        ]}]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error ? data.error.message : "HTTP " + r.status);
+    const v = parseVerdict(data.content.map(c => c.text || "").join(""));
+    render(v);
+  } catch (e) {
+    $("#result").innerHTML = `<div class="card SKIP">Error: ${e.message}</div>` + prev;
+  } finally {
+    $("#scan").disabled = false;
+  }
+}
+
+function render(v){
+  const card = `<div class="card ${v.verdict}">
+    <div class="verdict">${v.verdict} · ${v.est}</div>
+    <div class="item">${v.item}</div>
+    <div class="muted">${v.reason}</div>
+    <div class="muted">${new Date().toLocaleTimeString()}</div></div>`;
+  // drop the "Scanning…" placeholder, keep history
+  const hist = $("#result").innerHTML.replace(/<div class="card MAYBE">Scanning…<\/div>/, "");
+  $("#result").innerHTML = card + hist;
+  if (v.verdict === "FLIP" && navigator.vibrate) navigator.vibrate(200);
+}
+
+function toggleAuto(){
+  if (autoTimer){ clearInterval(autoTimer); autoTimer = null; $("#autoBtn").textContent = "Auto: off"; }
+  else { autoTimer = setInterval(scan, 8000); $("#autoBtn").textContent = "Auto: on";  // ponytail: 8s interval; each tick is a paid API call
+    scan(); }
+}
+
+// boot
+if (getKey()) start(); else showSetup();
+</script>
+</body>
+</html>
