@@ -111,6 +111,10 @@ ExecStart=/usr/bin/python3 -m http.server 8088 --directory /opt/thriftily
 
 ---
 
+## License
+
+[MIT](LICENSE) © 2026 Dennis Sirois.
+
 ## Notes
 
 Personal project — provided as-is, no warranty. You are responsible for your own API usage and
